@@ -15,10 +15,11 @@
 -export([handle_doc_show_req/3, handle_doc_update_req/3, handle_view_list_req/3]).
 
 -include_lib("couch/include/couch_db.hrl").
+-include_lib("couch_mrview/include/couch_mrview.hrl").
 
 -record(lacc, {
     req,
-    resp = nil,
+    resp = undefined,
     qserver,
     lname,
     db,
@@ -180,14 +181,16 @@ handle_view_list_req(#httpd{method='POST'}=Req, _Db, _DDoc) ->
 handle_view_list_req(Req, _Db, _DDoc) ->
     chttpd:send_method_not_allowed(Req, "GET,POST,HEAD").
 
-handle_view_list(Req, Db, DDoc, LName, {ViewDesignName, ViewName}, Keys) ->
+handle_view_list(Req, Db, DDoc, LName, {ViewDesignName, ViewName}, Keys0) ->
+    Keys = case Keys0 of
+        nil -> undefined;
+        _ -> Keys0
+    end,
     {ok, VDoc} = fabric:open_doc(Db, <<"_design/", ViewDesignName/binary>>, []),
-    Group = couch_view_group:design_doc_to_view_group(VDoc),
-    IsReduce = chttpd_view:get_reduce_type(Req),
-    ViewType = chttpd_view:extract_view_type(ViewName, Group#group.views,
-        IsReduce),
-    QueryArgs = chttpd_view:parse_view_params(Req, Keys, ViewType),
-    CB = fun list_callback/2,
+    {ok, #mrst{views=Views}} = couch_mrview_util:ddoc_to_mrst(Db, DDoc),
+    QueryArgs0 = couch_mrview_http:parse_qs(Req, Keys),
+    QueryArgs = couch_mrview_util:set_view_type(QueryArgs0, ViewName, Views),
+    CB = fun list_cb/2,
     Etag = couch_uuids:new(),
     chttpd:etag_respond(Req, Etag, fun() ->
         couch_query_servers:with_ddoc_proc(DDoc, fun(QServer) ->
@@ -202,34 +205,35 @@ handle_view_list(Req, Db, DDoc, LName, {ViewDesignName, ViewName}, Keys) ->
         end)
     end).
 
-list_callback({total_and_offset, Total, Offset}, #lacc{resp=nil} = Acc) ->
-    start_list_resp({[{<<"total_rows">>, Total}, {<<"offset">>, Offset}]}, Acc);
-list_callback({total_and_offset, _, _}, Acc) ->
-    % a sorted=false view where the message came in late.  Ignore.
-    {ok, Acc};
-list_callback({row, Row}, #lacc{resp=nil} = Acc) ->
-    % first row of a reduce view, or a sorted=false view
+
+list_cb({meta, Meta}, #lacc{resp=undefined} = Acc) ->
+    MetaProps = case couch_util:get_value(total, Meta) of
+        undefined -> [];
+        Total -> [{total_rows, Total}]
+    end ++ case couch_util:get_value(offset, Meta) of
+        undefined -> [];
+        Offset -> [{offset, Offset}]
+    end ++ case couch_util:get_value(update_seq, Meta) of
+        undefined -> [];
+        UpdateSeq -> [{update_seq, UpdateSeq}]
+    end,
+    start_list_resp({MetaProps}, Acc);
+list_cb({row, Row}, #lacc{resp=undefined} = Acc) ->
     {ok, NewAcc} = start_list_resp({[]}, Acc),
     send_list_row(Row, NewAcc);
-list_callback({row, Row}, Acc) ->
+list_cb({row, Row}, Acc) ->
     send_list_row(Row, Acc);
-list_callback(complete, Acc) ->
+list_cb(complete, Acc) ->
     #lacc{qserver = {Proc, _}, resp = Resp0} = Acc,
     if Resp0 =:= nil ->
         {ok, #lacc{resp = Resp}} = start_list_resp({[]}, Acc);
     true ->
         Resp = Resp0
     end,
-    try couch_query_servers:proc_prompt(Proc, [<<"list_end">>]) of
-    [<<"end">>, Chunk] ->
-        {ok, Resp1} = send_non_empty_chunk(Resp, Chunk),
-        chttpd:send_delayed_last_chunk(Resp1)
-    catch Error ->
-        {ok, Resp1} = chttpd:send_delayed_error(Resp, Error),
-        {stop, Resp1}
-    end;
-list_callback({error, Reason}, #lacc{resp=Resp}) ->
-    chttpd:send_delayed_error(Resp, Reason).
+    [<<"end">>, Data] = couch_query_servers:proc_prompt(Proc, [<<"list_end">>]),
+    send_non_empty_chunk(Resp, Data),
+    couch_httpd:last_chunk(Resp),
+    {ok, Resp}.
 
 start_list_resp(Head, Acc) ->
     #lacc{
@@ -259,17 +263,30 @@ start_list_resp(Head, Acc) ->
     {ok, Acc#lacc{resp=Resp}}.
 
 send_list_row(Row, #lacc{qserver = {Proc, _}, resp = Resp} = Acc) ->
-    try couch_query_servers:proc_prompt(Proc, [<<"list_row">>, Row]) of
+    RowObj = case couch_util:get_value(id, Row) of
+        undefined -> [];
+        Id -> [{id, Id}]
+    end ++ case couch_util:get_value(key, Row) of
+        undefined -> [];
+        Key -> [{key, Key}]
+    end ++ case couch_util:get_value(value, Row) of
+        undefined -> [];
+        Val -> [{value, Val}]
+    end ++ case couch_util:get_value(doc, Row) of
+        undefined -> [];
+        Doc -> [{doc, Doc}]
+    end,
+    try couch_query_servers:proc_prompt(Proc, [<<"list_row">>, {RowObj}]) of
     [<<"chunks">>, Chunk] ->
         {ok, Resp1} = send_non_empty_chunk(Resp, Chunk),
         {ok, Acc#lacc{resp=Resp1}};
     [<<"end">>, Chunk] ->
-        {ok, Resp1} = send_non_empty_chunk(Resp, Chunk),
-        {ok, Resp2} = chttpd:send_delayed_last_chunk(Resp1),
-        {stop, Resp2}
+        send_non_empty_chunk(Resp, Chunk),
+        {ok, Resp1} = couch_httpd:send_delayed_last_chunk(Resp),
+        {stop, Acc#lacc{resp=Resp1}}
     catch Error ->
-        {ok, Resp1} = chttpd:send_delayed_error(Resp, Error),
-        {stop, Resp1}
+        {ok, Resp1} = couch_httpd:send_delayed_error(Resp, Error),
+        {stop, Acc#lacc{resp=Resp1}}
     end.
 
 send_non_empty_chunk(Resp, []) ->

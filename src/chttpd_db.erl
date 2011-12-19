@@ -32,6 +32,14 @@
     atts_since = nil
 }).
 
+-record(vacc, {
+    db,
+    req,
+    resp,
+    prepend,
+    etag
+}).
+
 % Database request handlers
 handle_request(#httpd{path_parts=[DbName|RestParts],method=Method,
         db_url_handlers=DbUrlHandlers}=Req)->
@@ -355,7 +363,7 @@ db_req(#httpd{path_parts=[_,<<"_purge">>]}=Req, _Db) ->
     send_method_not_allowed(Req, "POST");
 
 db_req(#httpd{method='GET',path_parts=[_,<<"_all_docs">>]}=Req, Db) ->
-    all_docs_view(Req, Db, nil);
+    all_docs_view(Req, Db, undefined);
 
 db_req(#httpd{method='POST',path_parts=[_,<<"_all_docs">>]}=Req, Db) ->
     {Fields} = chttpd:json_body_obj(Req),
@@ -363,7 +371,7 @@ db_req(#httpd{method='POST',path_parts=[_,<<"_all_docs">>]}=Req, Db) ->
     Keys when is_list(Keys) ->
         all_docs_view(Req, Db, Keys);
     nil ->
-        all_docs_view(Req, Db, nil);
+        all_docs_view(Req, Db, undefined);
     _ ->
         throw({bad_request, "`keys` body member must be an array."})
     end;
@@ -466,24 +474,13 @@ all_docs_view(Req, Db, Keys) ->
     Etag = couch_httpd:make_etag(Info),
     DeltaT = timer:now_diff(now(), T0) / 1000,
     couch_stats_collector:record({couchdb, dbinfo}, DeltaT),
-    QueryArgs = chttpd_view:parse_view_params(Req, Keys, map),
+    QueryArgs = couch_mrview_http:parse_qs(Req, Keys),
+    CB = fun chttpd_view:view_cb/2,
     chttpd:etag_respond(Req, Etag, fun() ->
-        {ok, Resp} = chttpd:start_delayed_json_response(Req, 200, [{"Etag",Etag}]),
-        fabric:all_docs(Db, fun all_docs_callback/2, {nil, Resp}, QueryArgs)
+        VAcc0 = #vacc{db=Db, req=Req},
+        {ok, VAcc} = fabric:all_docs(Db, CB, VAcc0, QueryArgs),
+        chttpd:end_delayed_json_response(VAcc#vacc.resp)
     end).
-
-all_docs_callback({total_and_offset, Total, Offset}, {_, Resp}) ->
-    Chunk = "{\"total_rows\":~p,\"offset\":~p,\"rows\":[\r\n",
-    {ok, Resp1} = chttpd:send_delayed_chunk(Resp, io_lib:format(Chunk, [Total, Offset])),
-    {ok, {"", Resp1}};
-all_docs_callback({row, Row}, {Prepend, Resp}) ->
-    {ok, Resp1} = chttpd:send_delayed_chunk(Resp, [Prepend, ?JSON_ENCODE(Row)]),
-    {ok, {",\r\n", Resp1}};
-all_docs_callback(complete, {_, Resp}) ->
-    {ok, Resp1} = chttpd:send_delayed_chunk(Resp, "\r\n]}"),
-    chttpd:end_delayed_json_response(Resp1);
-all_docs_callback({error, Reason}, {_, Resp}) ->
-    chttpd:send_delayed_error(Resp, Reason).
 
 db_doc_req(#httpd{method='DELETE'}=Req, Db, DocId) ->
     % check for the existence of the doc to handle the 404 case.

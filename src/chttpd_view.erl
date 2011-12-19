@@ -12,79 +12,138 @@
 
 -module(chttpd_view).
 -include_lib("couch/include/couch_db.hrl").
+-include_lib("couch_mrview/include/couch_mrview.hrl").
 
 -export([handle_view_req/3, handle_temp_view_req/2, get_reduce_type/1,
-    parse_view_params/3, view_group_etag/2, view_group_etag/3,
-    parse_bool_param/1, extract_view_type/3]).
+    view_group_etag/2, view_group_etag/3, parse_bool_param/1,
+    extract_view_type/3]).
 
+-export([view_cb/2]).
+
+-record(vacc, {
+    db,
+    req,
+    resp,
+    prepend,
+    etag
+}).
 
 multi_query_view(Req, Db, DDoc, ViewName, Queries) ->
-    Group = couch_view_group:design_doc_to_view_group(DDoc),
-    IsReduce = get_reduce_type(Req),
-    ViewType = extract_view_type(ViewName, Group#group.views, IsReduce),
     % TODO proper calculation of etag
     % Etag = view_group_etag(ViewGroup, Db, Queries),
     Etag = couch_uuids:new(),
+    {ok, #mrst{views=Views}} = couch_mrview_util:ddoc_to_mrst(Db, DDoc),
     DefaultParams = lists:flatmap(fun({K,V}) -> parse_view_param(K,V) end,
         chttpd:qs(Req)),
     [couch_stats_collector:increment({httpd, view_reads}) || _I <- Queries],
     chttpd:etag_respond(Req, Etag, fun() ->
         FirstChunk = "{\"results\":[",
         {ok, Resp} = chttpd:start_delayed_json_response(Req, 200, [{"Etag",Etag}], FirstChunk),
-        {_, Resp1} = lists:foldl(fun({QueryProps}, {Chunk, RespAcc}) ->
-            if Chunk =/= nil -> chttpd:send_delayed_chunk(Resp, Chunk); true -> ok end,
+        VAcc0 = #vacc{db=Db, req=Req, resp=Resp},
+        {_, VAcc} = lists:foldl(fun({QueryProps}, {Chunk, RespAcc}) ->
+            if Chunk =/= nil -> chttpd:send_delayed_chunk(RespAcc#vacc.resp, Chunk); true -> ok end,
             ThisQuery = lists:flatmap(fun parse_json_view_param/1, QueryProps),
-            FullParams = lists:ukeymerge(1, ThisQuery, DefaultParams),
-            {ok, RespAcc1} = fabric:query_view(
+            FullParams0 = lists:ukeymerge(1, ThisQuery, DefaultParams),
+            FullParams = couch_mrview:to_mrargs(FullParams0),
+            {ok, VAcc1} = fabric:query_view(
                 Db,
                 DDoc,
                 ViewName,
-                fun view_callback/2,
-                {nil, RespAcc},
-                parse_view_params(FullParams, nil, ViewType)
-            ),
-            {",\n", RespAcc1}
-        end, {nil,Resp}, Queries),
-        chttpd:send_delayed_chunk(Resp1, "]}"),
+                fun view_cb/2,
+                RespAcc,
+                couch_mrview_util:set_view_type(FullParams, ViewName, Views)),
+            {",\n", VAcc1}
+        end, {nil, VAcc0}, Queries),
+        {ok, Resp1} = chttpd:send_delayed_chunk(VAcc#vacc.resp, "]}"),
         chttpd:end_delayed_json_response(Resp1)
     end).
 
-design_doc_view(Req, Db, DDoc, ViewName, Keys) ->
-    Group = couch_view_group:design_doc_to_view_group(DDoc),
-    IsReduce = get_reduce_type(Req),
-    ViewType = extract_view_type(ViewName, Group#group.views, IsReduce),
-    QueryArgs = parse_view_params(Req, Keys, ViewType),
+design_doc_view(Req, Db, DDoc, ViewName, Keys0) ->
+    Keys = case Keys0 of % Keys should be undefined, not nil
+        nil -> undefined;
+        _ -> Keys0
+    end,
+    {ok, #mrst{views=Views}} = couch_mrview_util:ddoc_to_mrst(Db, DDoc),
+    QueryArgs0 = couch_mrview_http:parse_qs(Req, Keys),
+    QueryArgs = couch_mrview_util:set_view_type(QueryArgs0, ViewName, Views),
     % TODO proper calculation of etag
     % Etag = view_group_etag(ViewGroup, Db, Keys),
     Etag = couch_uuids:new(),
     couch_stats_collector:increment({httpd, view_reads}),
     chttpd:etag_respond(Req, Etag, fun() ->
-        {ok, Resp} = chttpd:start_delayed_json_response(Req, 200, [{"Etag",Etag}]),
-        CB = fun view_callback/2,
-        {ok, Resp1} = fabric:query_view(Db, DDoc, ViewName, CB, {nil, Resp}, QueryArgs),
-        chttpd:end_delayed_json_response(Resp1)
+        VAcc0 = #vacc{db=Db, req=Req},
+        CB = fun view_cb/2,
+        {ok, VAcc} = fabric:query_view(Db, DDoc, ViewName, CB, VAcc0, QueryArgs),
+        chttpd:end_delayed_json_response(VAcc#vacc.resp)
     end).
 
-view_callback({total_and_offset, Total, Offset}, {nil, Resp}) ->
-    Chunk = "{\"total_rows\":~p,\"offset\":~p,\"rows\":[\r\n",
-    {ok, Resp1} = chttpd:send_delayed_chunk(Resp, io_lib:format(Chunk, [Total, Offset])),
-    {ok, {"", Resp1}};
-view_callback({total_and_offset, _, _}, Acc) ->
-    % a sorted=false view where the message came in late.  Ignore.
-    {ok, Acc};
-view_callback({row, Row}, {nil, Resp}) ->
-    % first row of a reduce view, or a sorted=false view
-    {ok, Resp1} = chttpd:send_delayed_chunk(Resp, ["{\"rows\":[\r\n", ?JSON_ENCODE(Row)]),
-    {ok, {",\r\n", Resp1}};
-view_callback({row, Row}, {Prepend, Resp}) ->
-    {ok, Resp1} = chttpd:send_delayed_chunk(Resp, [Prepend, ?JSON_ENCODE(Row)]),
-    {ok, {",\r\n", Resp1}};
-view_callback(complete, {nil, Resp}) ->
-    chttpd:send_delayed_chunk(Resp, "{\"rows\":[]}");
-view_callback(complete, {_, Resp}) ->
-    chttpd:send_delayed_chunk(Resp, "\r\n]}");
-view_callback({error, Reason}, {_, Resp}) ->
-    chttpd:send_delayed_error(Resp, Reason).
+view_cb({meta, Meta}, Acc) ->
+    Headers = [{"ETag", Acc#vacc.etag}],
+    {ok, Resp} = case Acc#vacc.resp of
+        undefined ->
+            chttpd:start_delayed_json_response(Acc#vacc.req, 200, Headers);
+        _ ->            {ok, Acc#vacc.resp}
+    end,
+    % Map function starting
+    Parts = case couch_util:get_value(total, Meta) of
+        undefined -> [];
+        Total -> [io_lib:format("\"total_rows\":~p", [Total])]
+    end ++ case couch_util:get_value(offset, Meta) of
+        undefined -> [];
+        Offset -> [io_lib:format("\"offset\":~p", [Offset])]
+    end ++ case couch_util:get_value(update_seq, Meta) of
+        undefined -> [];
+        UpdateSeq -> [io_lib:format("\"update_seq\":~p", [UpdateSeq])]
+    end ++ ["\"rows\":["],
+    Chunk = lists:flatten("{" ++ string:join(Parts, ",") ++ "\r\n"),
+    {ok, Resp1} = chttpd:send_delayed_chunk(Resp, Chunk),
+    {ok, Acc#vacc{resp=Resp1, prepend=""}};
+view_cb({row, Row}, #vacc{resp=undefined}=Acc) ->
+    % Reduce function starting
+    Headers = [{"ETag", Acc#vacc.etag}],
+    {ok, Resp} = chttpd:start_delayed_json_response(Acc#vacc.req, 200, Headers),
+    {ok, Resp1} = chttpd:send_delayed_chunk(Resp,
+            ["{\"rows\":[\r\n", row_to_json(Row)]),
+    {ok, #vacc{resp=Resp1, prepend=",\r\n"}};
+view_cb({row, Row}, Acc) ->
+    % Adding another row
+    {ok, Resp} = chttpd:send_delayed_chunk(Acc#vacc.resp, [Acc#vacc.prepend, row_to_json(Row)]),
+    {ok, Acc#vacc{resp=Resp, prepend=",\r\n"}};
+view_cb(complete, #vacc{resp=undefined}=Acc) ->
+    % Nothing in view
+    {ok, Resp} = chttpd:send_json(Acc#vacc.req, 200, {[{rows, []}]}),
+    {ok, Acc#vacc{resp=Resp}};
+view_cb(complete, Acc) ->
+    % Finish view output
+    {ok, Resp} = chttpd:send_delayed_chunk(Acc#vacc.resp, ["\r\n]}"]),
+    {ok, Acc#vacc{resp=Resp}}.
+
+
+row_to_json(Row) ->
+    Id = couch_util:get_value(id, Row),
+    row_to_json(Id, Row).
+
+row_to_json(error, Row) ->
+    % Special case for _all_docs request with KEYS to
+    % match prior behavior.
+    Key = couch_util:get_value(key, Row),
+    Val = couch_util:get_value(value, Row),
+    Obj = {[{key, Key}, {error, Val}]},
+    ?JSON_ENCODE(Obj);
+row_to_json(Id0, Row) ->
+    Id = case Id0 of
+        undefined -> [];
+        Id0 -> [{id, Id0}]
+    end,
+    Key = couch_util:get_value(key, Row, null),
+    Val = couch_util:get_value(value, Row),
+    Doc = case couch_util:get_value(doc, Row) of
+        undefined -> [];
+        Doc0 -> [{doc, Doc0}]
+    end,
+    Obj = {Id ++ [{key, Key}, {value, Val}] ++ Doc},
+    ?JSON_ENCODE(Obj).
+
 
 extract_view_type(_ViewName, [], _IsReduce) ->
     throw({not_found, missing_named_view});
@@ -130,42 +189,9 @@ handle_temp_view_req(Req, _Db) ->
     Msg = <<"Temporary views are not supported in BigCouch">>,
     chttpd:send_error(Req, 403, forbidden, Msg).
 
-reverse_key_default(?MIN_STR) -> ?MAX_STR;
-reverse_key_default(?MAX_STR) -> ?MIN_STR;
-reverse_key_default(Key) -> Key.
-
 get_reduce_type(Req) ->
     list_to_existing_atom(chttpd:qs_value(Req, "reduce", "true")).
 
-parse_view_params(Req, Keys, ViewType) when not is_list(Req) ->
-    QueryParams = lists:flatmap(fun({K,V}) -> parse_view_param(K,V) end,
-        chttpd:qs(Req)),
-    parse_view_params(QueryParams, Keys, ViewType);
-parse_view_params(QueryParams, Keys, ViewType) ->
-    IsMultiGet = (Keys =/= nil),
-    Args = #view_query_args{
-        view_type=ViewType,
-        multi_get=IsMultiGet,
-        keys=Keys
-    },
-    QueryArgs = lists:foldl(fun({K, V}, Args2) ->
-        validate_view_query(K, V, Args2)
-    end, Args, QueryParams),
-
-    GroupLevel = QueryArgs#view_query_args.group_level,
-    case {ViewType, GroupLevel, IsMultiGet} of
-        {reduce, exact, true} ->
-            QueryArgs;
-        {reduce, _, false} ->
-            QueryArgs;
-        {reduce, _, _} ->
-            Msg = <<"Multi-key fetchs for reduce "
-                    "view must include `group=true`">>,
-            throw({query_parse_error, Msg});
-        _ ->
-            QueryArgs
-    end,
-    QueryArgs.
 
 parse_json_view_param({<<"key">>, V}) ->
     [{start_key, V}, {end_key, V}];
@@ -261,100 +287,6 @@ parse_view_param("sorted", Value) ->
     [{sorted, parse_bool_param(Value)}];
 parse_view_param(Key, Value) ->
     [{extra, {Key, Value}}].
-
-validate_view_query(start_key, Value, Args) ->
-    case Args#view_query_args.multi_get of
-        true ->
-            Msg = <<"Query parameter `start_key` is "
-                    "not compatiible with multi-get">>,
-            throw({query_parse_error, Msg});
-        _ ->
-            Args#view_query_args{start_key=Value}
-    end;
-validate_view_query(start_docid, Value, Args) ->
-    Args#view_query_args{start_docid=Value};
-validate_view_query(end_key, Value, Args) ->
-    case Args#view_query_args.multi_get of
-        true->
-            Msg = <<"Query paramter `end_key` is "
-                    "not compatibile with multi-get">>,
-            throw({query_parse_error, Msg});
-        _ ->
-            Args#view_query_args{end_key=Value}
-    end;
-validate_view_query(end_docid, Value, Args) ->
-    Args#view_query_args{end_docid=Value};
-validate_view_query(limit, Value, Args) ->
-    Args#view_query_args{limit=Value};
-validate_view_query(list, Value, Args) ->
-    Args#view_query_args{list=Value};
-validate_view_query(stale, Value, Args) ->
-    Args#view_query_args{stale=Value};
-validate_view_query(descending, true, Args) ->
-    case Args#view_query_args.direction of
-        rev -> Args; % Already reversed
-        fwd ->
-            Args#view_query_args{
-                direction = rev,
-                start_docid =
-                    reverse_key_default(Args#view_query_args.start_docid),
-                end_docid =
-                    reverse_key_default(Args#view_query_args.end_docid)
-            }
-    end;
-validate_view_query(descending, false, Args) ->
-    Args; % Ignore default condition
-validate_view_query(skip, Value, Args) ->
-    Args#view_query_args{skip=Value};
-validate_view_query(group_level, Value, Args) ->
-    case Args#view_query_args.view_type of
-        reduce ->
-            Args#view_query_args{group_level=Value};
-        _ ->
-            Msg = <<"Invalid URL parameter 'group' or "
-                    " 'group_level' for non-reduce view.">>,
-            throw({query_parse_error, Msg})
-    end;
-validate_view_query(inclusive_end, Value, Args) ->
-    Args#view_query_args{inclusive_end=Value};
-validate_view_query(reduce, false, Args) ->
-    Args;
-validate_view_query(reduce, _, Args) ->
-    case Args#view_query_args.view_type of
-        map ->
-            Msg = <<"Invalid URL parameter `reduce` for map view.">>,
-            throw({query_parse_error, Msg});
-        _ ->
-            Args
-    end;
-validate_view_query(include_docs, true, Args) ->
-    case Args#view_query_args.view_type of
-        reduce ->
-            Msg = <<"Query paramter `include_docs` "
-                    "is invalid for reduce views.">>,
-            throw({query_parse_error, Msg});
-        _ ->
-            Args#view_query_args{include_docs=true}
-    end;
-validate_view_query(include_docs, _Value, Args) ->
-    Args;
-validate_view_query(conflicts, true, Args) ->
-    case Args#view_query_args.view_type of
-    reduce ->
-        Msg = <<"Query parameter `conflicts` "
-                "is invalid for reduce views.">>,
-        throw({query_parse_error, Msg});
-    _ ->
-        Args#view_query_args{conflicts = true}
-    end;
-validate_view_query(conflicts, _Value, Args) ->
-    Args;
-validate_view_query(sorted, false, Args) ->
-    Args#view_query_args{sorted=false};
-validate_view_query(sorted, _Value, Args) ->
-    Args;
-validate_view_query(extra, _Value, Args) ->
-    Args.
 
 view_group_etag(Group, Db) ->
     view_group_etag(Group, Db, nil).
