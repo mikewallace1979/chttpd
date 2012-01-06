@@ -12,7 +12,8 @@
 
 -module(chttpd_show).
 
--export([handle_doc_show_req/3, handle_doc_update_req/3, handle_view_list_req/3]).
+-export([handle_doc_show_req/3, handle_doc_update_req/3,
+        handle_view_list_req/3, list_cb/2]).
 
 -include_lib("couch/include/couch_db.hrl").
 -include_lib("couch_mrview/include/couch_mrview.hrl").
