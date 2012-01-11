@@ -11,6 +11,7 @@
 % the License.
 
 -module(chttpd_view).
+-include("chttpd.hrl").
 -include_lib("couch/include/couch_db.hrl").
 -include_lib("couch_mrview/include/couch_mrview.hrl").
 
@@ -19,14 +20,6 @@
     extract_view_type/3]).
 
 -export([view_cb/2]).
-
--record(vacc, {
-    db,
-    req,
-    resp,
-    prepend,
-    etag
-}).
 
 multi_query_view(Req, Db, DDoc, ViewName, Queries) ->
     % TODO proper calculation of etag
