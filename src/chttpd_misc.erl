@@ -19,19 +19,12 @@
     handle_utils_dir_req/1, handle_favicon_req/1, handle_system_req/1]).
 
 
+-include("chttpd.hrl").
 -include_lib("couch/include/couch_db.hrl").
 
 -import(chttpd,
     [send_json/2,send_json/3,send_method_not_allowed/2,
     send_chunk/2,start_chunked_response/3]).
-
--record(vacc, {
-    db,
-    req,
-    resp,
-    prepend,
-    etag
-}).
 
 % httpd global handlers
 

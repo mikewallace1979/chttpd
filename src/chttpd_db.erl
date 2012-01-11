@@ -11,6 +11,7 @@
 % the License.
 
 -module(chttpd_db).
+-include("chttpd.hrl").
 -include_lib("couch/include/couch_db.hrl").
 
 -export([handle_request/1, handle_compact_req/2, handle_design_req/2,
@@ -30,14 +31,6 @@
     open_revs = [],
     update_type = interactive_edit,
     atts_since = nil
-}).
-
--record(vacc, {
-    db,
-    req,
-    resp,
-    prepend,
-    etag
 }).
 
 % Database request handlers
