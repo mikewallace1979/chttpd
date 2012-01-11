@@ -25,6 +25,14 @@
     [send_json/2,send_json/3,send_method_not_allowed/2,
     send_chunk/2,start_chunked_response/3]).
 
+-record(vacc, {
+    db,
+    req,
+    resp,
+    prepend,
+    etag
+}).
+
 % httpd global handlers
 
 handle_welcome_req(Req) ->
@@ -94,27 +102,29 @@ handle_all_dbs_req(#httpd{method='GET'}=Req) ->
     Etag = couch_httpd:make_etag({Info}),
     chttpd:etag_respond(Req, Etag, fun() ->
         {ok, Resp} = chttpd:start_delayed_json_response(Req, 200, [{"Etag",Etag}]),
+        VAcc = #vacc{req=Req, resp=Resp},
         fabric:all_docs(ShardDbName, fun all_dbs_callback/2,
-            {nil, Resp}, #view_query_args{})
+            VAcc, [])
     end);
 handle_all_dbs_req(Req) ->
     send_method_not_allowed(Req, "GET,HEAD").
 
-all_dbs_callback({total_and_offset, _Total, _Offset}, {_, Resp}) ->
-    {ok, Resp1} = chttpd:send_delayed_chunk(Resp, "["),
-    {ok, {"", Resp1}};
-all_dbs_callback({row, {Row}}, {Prepend, Resp}) ->
+all_dbs_callback({meta, _Meta}, Acc) ->
+    {ok, Resp1} = chttpd:send_delayed_chunk(Acc#vacc.resp, "["),
+    {ok, Acc#vacc{resp=Resp1, prepend=""}};
+all_dbs_callback({row, Row}, Acc) ->
+    #vacc{prepend=Prepend, resp=Resp} = Acc,
     case couch_util:get_value(id, Row) of <<"_design", _/binary>> ->
-        {ok, {Prepend, Resp}};
+        {ok, Acc};
     DbName ->
         {ok, Resp1} = chttpd:send_delayed_chunk(Resp, [Prepend, ?JSON_ENCODE(DbName)]),
-        {ok, {",", Resp1}}
+        {ok, Acc#vacc{resp=Resp1, prepend=","}}
     end;
-all_dbs_callback(complete, {_, Resp}) ->
-    {ok, Resp1} = chttpd:send_delayed_chunk(Resp, "]"),
+all_dbs_callback(complete, Acc) ->
+    {ok, Resp1} = chttpd:send_delayed_chunk(Acc#vacc.resp, "]"),
     chttpd:end_delayed_json_response(Resp1);
-all_dbs_callback({error, Reason}, {_, Resp}) ->
-    chttpd:send_delayed_error(Resp, Reason).
+all_dbs_callback({error, Reason}, Acc) ->
+    chttpd:send_delayed_error(Acc#vacc.resp, Reason).
 
 handle_task_status_req(#httpd{method='GET'}=Req) ->
     {Replies, _BadNodes} = gen_server:multi_call(couch_task_status, all),
