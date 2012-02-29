@@ -730,7 +730,14 @@ send_docs_multipart(Req, Results, Options1) ->
     couch_httpd:last_chunk(Resp).
 
 receive_request_data(Req) ->
-    {couch_httpd:recv(Req, 0), fun() -> receive_request_data(Req) end}.
+    receive_request_data(Req, chttpd:body_length(Req)).
+
+receive_request_data(Req, LenLeft) when LenLeft > 0 ->
+    Len = erlang:min(4096, LenLeft),
+    Data = chttpd:recv(Req, Len),
+    {Data, fun() -> receive_request_data(Req, LenLeft - iolist_size(Data)) end};
+receive_request_data(_Req, _) ->
+    throw(<<"expected more data">>).
 
 update_doc_result_to_json({{Id, Rev}, Error}) ->
         {_Code, Err, Msg} = chttpd:error_info(Error),
@@ -757,15 +764,26 @@ update_doc(Req, Db, DocId, Doc, Headers) ->
 update_doc(#httpd{user_ctx=Ctx} = Req, Db, DocId, #doc{deleted=Deleted}=Doc,
         Headers, UpdateType) ->
     W = couch_httpd:qs_value(Req, "w", integer_to_list(mem3:quorum(Db))),
-    case couch_httpd:header_value(Req, "X-Couch-Full-Commit") of
-    "true" ->
-        Options = [full_commit, UpdateType, {user_ctx,Ctx}, {w,W}];
-    "false" ->
-        Options = [delay_commit, UpdateType, {user_ctx,Ctx}, {w,W}];
+    Options =
+        case couch_httpd:header_value(Req, "X-Couch-Full-Commit") of
+        "true" ->
+            [full_commit, UpdateType, {user_ctx,Ctx}, {w,W}];
+        "false" ->
+            [delay_commit, UpdateType, {user_ctx,Ctx}, {w,W}];
+        _ ->
+            [UpdateType, {user_ctx,Ctx}, {w,W}]
+        end,
+    {_, Ref} = spawn_monitor(fun() -> exit(fabric:update_doc(Db, Doc, Options)) end),
+    Result = receive {'DOWN', Ref, _, _, Res} -> Res end,
+    case Result of
+    {{nocatch, Exception}, _Reason} ->
+        % Exceptions from spawned processes are swallowed and returned, rethrow
+        throw(Exception);
     _ ->
-        Options = [UpdateType, {user_ctx,Ctx}, {w,W}]
+        ok
     end,
-    case fabric:update_doc(Db, Doc, Options) of
+
+    case Result of
     {ok, NewRev} ->
         Accepted = false;
     {accepted, NewRev} ->
